@@ -1,36 +1,104 @@
 #!/usr/bin/env bash
-# Helper for the Puppet wireguard::roadwarrior class.
-# All paths are supplied by Puppet, and this runs as root.
+# Node-local WireGuard key and peer-PSK management for Puppet.
 set -euo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-usage() {
-  echo "Usage: $0 {generate-key|update-public-key|public-key-matches|key-matches|install-config|sync-config} ..." >&2
-  exit 2
+fail() { echo "wireguard-helper: $*" >&2; exit 1; }
+usage() { fail 'usage: wireguard-helper OPERATION ARGUMENTS...'; }
+
+# A Puppet-managed peer comment of this form marks a node-local PSK:
+#   # PuppetPSKFile = /etc/wireguard/psks/wg0-laptop.psk
+# The marker is ignored by wg(8); the PSK itself never enters a catalog.
+scan_psks() {
+  local config="$1" line pub='' psk='' in_peer=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^\[Peer\][[:space:]]*$ || "$line" =~ ^\[Interface\][[:space:]]*$ ]]; then
+      if [[ -n "$psk" ]]; then
+        [[ -n "$pub" ]] || fail "PSK marker without peer PublicKey in $config"
+        printf '%s\t%s\n' "$pub" "$psk"
+      fi
+      pub=''; psk=''
+      if [[ "$line" =~ ^\[Peer\] ]]; then in_peer=1; else in_peer=0; fi
+    elif (( in_peer )); then
+      if [[ "$line" =~ ^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+        pub="${BASH_REMATCH[1]}"
+      elif [[ "$line" =~ ^#[[:space:]]*PuppetPSKFile[[:space:]]*=[[:space:]]*(/etc/wireguard/psks/[A-Za-z0-9_.-]+\.psk)[[:space:]]*$ ]]; then
+        [[ -z "$psk" ]] || fail "Duplicate PSK marker in $config"
+        psk="${BASH_REMATCH[1]}"
+      fi
+    fi
+  done < "$config"
+  if [[ -n "$psk" ]]; then
+    [[ -n "$pub" ]] || fail "PSK marker without peer PublicKey in $config"
+    printf '%s\t%s\n' "$pub" "$psk"
+  fi
 }
 
-[[ $# -ge 1 ]] || usage
-operation="$1"
-shift
+valid_psk() {
+  local path="$1" key decoded_length
+  [[ -f "$path" && ! -L "$path" ]] || fail "Missing or symlink PSK file: $path"
+  key="$(cat -- "$path")" || fail "Cannot read PSK file: $path"
+  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || fail "PSK file has invalid base64 format: $path"
+  decoded_length="$(printf '%s' "$key" | base64 --decode | wc -c)" || fail "PSK base64 decoding failed: $path"
+  [[ "$decoded_length" -eq 32 ]] || fail "PSK must decode to 32 bytes: $path"
+}
 
+validate_psks() {
+  local config="$1" mapfile pub path
+  mapfile="$(mktemp /etc/wireguard/.wg-psk-map.XXXXXXXX)"
+  scan_psks "$config" > "$mapfile" || { rm -f -- "$mapfile"; return 1; }
+  while IFS=$'\t' read -r pub path; do
+    [[ -n "$pub" ]] || continue
+    valid_psk "$path" || { rm -f -- "$mapfile"; return 1; }
+  done < "$mapfile"
+  rm -f -- "$mapfile"
+}
+
+# Emit a temporary wg(8)-format config with PSKs inserted into the
+# appropriate [Peer] sections. Only a root-owned temporary file holds this.
+render_sync_config() {
+  local input="$1" output="$2" map pub path line current_pub=''
+  local -A by_key=()
+  map="$(mktemp /etc/wireguard/.wg-psk-map.XXXXXXXX)"
+  scan_psks "$input" > "$map" || { rm -f -- "$map"; return 1; }
+  while IFS=$'\t' read -r pub path; do
+    [[ -n "$pub" ]] || continue
+    valid_psk "$path"
+    [[ -z "${by_key[$pub]+found}" ]] || fail "Duplicate PSK peer public key: $pub"
+    by_key["$pub"]="$path"
+  done < "$map"
+  rm -f -- "$map"
+
+  : > "$output"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^\[Peer\][[:space:]]*$ || "$line" =~ ^\[Interface\][[:space:]]*$ ]]; then
+      if [[ -n "$current_pub" && -n "${by_key[$current_pub]+found}" ]]; then
+        printf 'PresharedKey = %s\n' "$(cat -- "${by_key[$current_pub]}")" >> "$output"
+      fi
+      current_pub=''
+    elif [[ "$line" =~ ^[[:space:]]*PublicKey[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+      current_pub="${BASH_REMATCH[1]}"
+    fi
+    printf '%s\n' "$line" >> "$output"
+  done < "$input"
+  if [[ -n "$current_pub" && -n "${by_key[$current_pub]+found}" ]]; then
+    printf 'PresharedKey = %s\n' "$(cat -- "${by_key[$current_pub]}")" >> "$output"
+  fi
+}
+
+operation="${1:-}"; [[ -n "$operation" ]] || usage; shift
 case "$operation" in
-  generate-key)
+  generate-key|generate-psk)
     [[ $# -eq 1 ]] || usage
     target="$1"
-    # Never replace an existing identity, even if two processes race.
     [[ ! -e "$target" && ! -L "$target" ]] || exit 0
-    # Hard-link creation fails if target already exists; unlike rename it
-    # cannot overwrite an existing identity. The temporary file is local.
     tmp="$(mktemp "${target}.XXXXXXXX")"
     trap 'rm -f -- "$tmp"' EXIT
-    wg genkey > "$tmp"
+    if [[ "$operation" == generate-key ]]; then wg genkey > "$tmp"; else wg genpsk > "$tmp"; fi
     chmod 0600 "$tmp"
-    ln -- "$tmp" "$target"
-    rm -f -- "$tmp"
-    trap - EXIT
+    ln -- "$tmp" "$target"     # Exclusive creation; never overwrite identity.
     ;;
-
   update-public-key)
     [[ $# -eq 2 ]] || usage
     tmp="$(mktemp "${2}.XXXXXXXX")"
@@ -38,77 +106,71 @@ case "$operation" in
     wg pubkey < "$1" > "$tmp"
     chmod 0644 "$tmp"
     mv -f -- "$tmp" "$2"
-    trap - EXIT
     ;;
-
   public-key-matches)
     [[ $# -eq 2 ]] || usage
     [[ -f "$2" ]] || exit 1
-    actual="$(wg pubkey < "$1")"
-    stored="$(cat "$2")"
-    [[ "$actual" == "$stored" ]]
+    [[ "$(wg pubkey < "$1")" == "$(cat -- "$2")" ]]
     ;;
-
   key-matches)
     [[ $# -eq 2 ]] || usage
-    interface="$1"
-    private_key="$2"
-    on_disk="$(wg pubkey < "$private_key")"
-    in_use="$(wg show "$interface" public-key)" || exit 1
-    [[ "$on_disk" == "$in_use" ]]
+    [[ "$(wg show "$1" public-key)" == "$(wg pubkey < "$2")" ]]
     ;;
-
   install-config)
     [[ $# -eq 2 ]] || usage
-    staged="$1"
-    live="$2"
-    # Staged basename MUST be <interface>.conf for wg-quick.
-    # This validates wg-quick processing, but not the kernel's full
-    # WireGuard configuration parser.
-    wg-quick strip "$staged" >/dev/null
-    # Same-directory temporary file guarantees same-filesystem rename.
+    staged="$1"; live="$2"
+    wg-quick strip "$staged" > /dev/null
+    validate_psks "$staged"
     tmp="$(mktemp "${live}.XXXXXXXX")"
     trap 'rm -f -- "$tmp"' EXIT
     install -o root -g root -m 0600 -- "$staged" "$tmp"
-    mv -f -- "$tmp" "$live"
-    trap - EXIT
+    mv -f -- "$tmp" "$live"  # Same-directory atomic replacement.
     ;;
-
+  apply-psks)
+    [[ $# -eq 2 ]] || usage
+    interface="$1"; config="$2"
+    map="$(mktemp /etc/wireguard/.wg-psk-map.XXXXXXXX)"
+    trap 'rm -f -- "$map"' EXIT
+    scan_psks "$config" > "$map"
+    while IFS=$'\t' read -r pub path; do
+      [[ -n "$pub" ]] || continue
+      valid_psk "$path"
+      wg set "$interface" peer "$pub" preshared-key "$path"
+    done < "$map"
+    ;;
+  psks-match)
+    [[ $# -eq 2 ]] || usage
+    interface="$1"; config="$2"
+    map="$(mktemp /etc/wireguard/.wg-psk-map.XXXXXXXX)"
+    trap 'rm -f -- "$map"' EXIT
+    scan_psks "$config" > "$map"
+    current="$(wg show "$interface" preshared-keys)" || exit 1
+    declare -A actual=()
+    while IFS=$'\t' read -r pub key; do
+      [[ -n "$pub" ]] && actual["$pub"]="$key"
+    done <<< "$current"
+    while IFS=$'\t' read -r pub path; do
+      [[ -n "$pub" ]] || continue
+      valid_psk "$path"
+      [[ "${actual[$pub]-}" == "$(cat -- "$path")" ]] || exit 1
+    done < "$map"
+    ;;
   sync-config)
     [[ $# -eq 2 ]] || usage
-    interface="$1"
-    live="$2"
-    # Do not use process substitution: if strip fails, wg might receive
-    # an empty file and inadvertently remove peers.
-    stripped="$(mktemp /etc/wireguard/.wg-sync.XXXXXXXX)"
-    trap 'rm -f -- "$stripped"' EXIT
-    wg-quick strip "$live" > "$stripped"
-    wg syncconf "$interface" "$stripped"
+    interface="$1"; config="$2"
+    stripped="$(mktemp /etc/wireguard/.wg-stripped.XXXXXXXX)"
+    expanded="$(mktemp /etc/wireguard/.wg-sync.XXXXXXXX)"
+    trap 'rm -f -- "$stripped" "$expanded"' EXIT
+    wg-quick strip "$config" > "$stripped"
+    render_sync_config "$stripped" "$expanded"
+    wg syncconf "$interface" "$expanded"
     ;;
-
   addresses-match)
     [[ $# -ge 2 ]] || usage
-
-    interface="$1"
-    shift
-
-    # Retrieve all addresses on the interface.
-    ip_output="$(ip -o address show dev "$interface")" || exit 1
-
-    # Ignore automatically assigned IPv6 link-local addresses.
-    actual="$(
-      printf '%s\n' "$ip_output" |
-        awk '$3 == "inet" || ($3 == "inet6" && $4 !~ /^fe80:/) {print $4}' |
-        LC_ALL=C sort -u
-    )"
-
-    # Puppet-specified addresses.
-    expected="$(
-      printf '%s\n' "$@" |
-        LC_ALL=C sort -u
-    )"
-
-    [[ "$actual" == "$expected" ]]
+    interface="$1"; shift
+    actual="$(ip -o address show dev "$interface" | awk '$3 == "inet" || ($3 == "inet6" && $4 !~ /^fe80:/) {print $4}' | sort -u)" || exit 1
+    desired="$(printf '%s\n' "$@" | sort -u)"
+    [[ "$actual" == "$desired" ]]
     ;;
   *) usage ;;
 esac

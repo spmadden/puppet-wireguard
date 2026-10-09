@@ -1,12 +1,10 @@
 {
   "name": "example-wireguard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Your Organization",
-  "summary": "Server-side road-warrior WireGuard peers with locally stored private keys",
+  "summary": "Node-local WireGuard server identities and per-peer preshared keys",
   "license": "Apache-2.0",
   "source": "https://example.invalid/puppet-wireguard",
   "dependencies": [],
-  "requirements": [
-    { "name": "puppet", "version_requirement": ">= 7.0.0 < 10.0.0" }
-  ]
+  "requirements": [{"name": "puppet", "version_requirement": ">= 7.0.0 < 10.0.0"}]
 }

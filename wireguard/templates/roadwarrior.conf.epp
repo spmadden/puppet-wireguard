@@ -3,25 +3,32 @@
   Integer[1, 65535] $listen_port,
   Optional[Integer] $mtu,
   String[1] $private_key_file,
+  String[1] $config_file,
+  String[1] $helper_file,
   Hash $peers,
 | -%>
 # Managed by Puppet. Do not edit.
-# The private key is generated and retained on this node.
+# All secret key material is stored separately on the managed node.
 
 [Interface]
 <% $addresses.each |String $address| { -%>
 Address = <%= $address %>
-<% } -%>ListenPort = <%= $listen_port %>
+<% } -%>
+ListenPort = <%= $listen_port %>
 <% if $mtu != undef { -%>
 MTU = <%= $mtu %>
 <% } -%>
 PostUp = /usr/bin/wg set %i private-key <%= $private_key_file %>
+PostUp = <%= $helper_file %> apply-psks %i <%= $config_file %>
 <% $peers.each |String $name, Hash $peer| { -%>
 
 # <%= $name %>
 [Peer]
 PublicKey = <%= $peer['public_key'] %>
 AllowedIPs = <%= $peer['allowed_ips'].join(', ') %>
+<% if $peer['preshared_key_file'] != undef { -%>
+# PuppetPSKFile = <%= $peer['preshared_key_file'] %>
+<% } -%>
 <% if $peer['endpoint'] != undef { -%>
 Endpoint = <%= $peer['endpoint'] %>
 <% } -%>
