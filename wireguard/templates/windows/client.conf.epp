@@ -1,0 +1,26 @@
+<%- |
+  Array[String[1], 1] $addresses,
+  Array[String[1]] $dns,
+  Optional[Integer] $mtu,
+  String[1] $server_public_key,
+  String[1] $endpoint,
+  Array[String[1], 1] $allowed_ips,
+  Optional[Integer] $persistent_keepalive,
+| -%>
+# Puppet-managed public profile. NO PRIVATE KEY OR PSK IN THIS FILE.
+[Interface]
+Address = <%= $addresses.join(', ') %>
+<% if $dns != [] { -%>
+DNS = <%= $dns.join(', ') %>
+<% } -%>
+<% if $mtu != undef { -%>
+MTU = <%= $mtu %>
+<% } -%>
+
+[Peer]
+PublicKey = <%= $server_public_key %>
+AllowedIPs = <%= $allowed_ips.join(', ') %>
+Endpoint = <%= $endpoint %>
+<% if $persistent_keepalive != undef { -%>
+PersistentKeepalive = <%= $persistent_keepalive %>
+<% } -%>

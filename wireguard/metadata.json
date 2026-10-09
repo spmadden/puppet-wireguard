@@ -2,9 +2,14 @@
   "name": "example-wireguard",
   "version": "1.1.0",
   "author": "Your Organization",
-  "summary": "Node-local WireGuard server identities and per-peer preshared keys",
+  "summary": "WireGuard Linux server and Windows road-warrior client management, using local keys and DPAPI",
   "license": "Apache-2.0",
   "source": "https://example.invalid/puppet-wireguard",
   "dependencies": [],
-  "requirements": [{"name": "puppet", "version_requirement": ">= 7.0.0 < 10.0.0"}]
+  "requirements": [
+    {
+      "name": "puppet",
+      "version_requirement": ">= 7.0.0 < 10.0.0"
+    }
+  ]
 }
