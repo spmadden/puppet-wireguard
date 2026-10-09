@@ -1,0 +1,31 @@
+<%- |
+  Array[String[1], 1] $addresses,
+  Integer[1, 65535] $listen_port,
+  Optional[Integer] $mtu,
+  String[1] $private_key_file,
+  Hash $peers,
+| -%>
+# Managed by Puppet. Do not edit.
+# The private key is generated and retained on this node.
+
+[Interface]
+<% $addresses.each |String $address| { -%>
+Address = <%= $address %>
+<% } -%>ListenPort = <%= $listen_port %>
+<% if $mtu != undef { -%>
+MTU = <%= $mtu %>
+<% } -%>
+PostUp = /usr/bin/wg set %i private-key <%= $private_key_file %>
+<% $peers.each |String $name, Hash $peer| { -%>
+
+# <%= $name %>
+[Peer]
+PublicKey = <%= $peer['public_key'] %>
+AllowedIPs = <%= $peer['allowed_ips'].join(', ') %>
+<% if $peer['endpoint'] != undef { -%>
+Endpoint = <%= $peer['endpoint'] %>
+<% } -%>
+<% if $peer['persistent_keepalive'] != undef { -%>
+PersistentKeepalive = <%= $peer['persistent_keepalive'] %>
+<% } -%>
+<% } -%>

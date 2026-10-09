@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Helper for the Puppet wireguard::roadwarrior class.
+# All paths are supplied by Puppet, and this runs as root.
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+usage() {
+  echo "Usage: $0 {generate-key|update-public-key|public-key-matches|key-matches|install-config|sync-config} ..." >&2
+  exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+operation="$1"
+shift
+
+case "$operation" in
+  generate-key)
+    [[ $# -eq 1 ]] || usage
+    target="$1"
+    # Never replace an existing identity, even if two processes race.
+    [[ ! -e "$target" && ! -L "$target" ]] || exit 0
+    # Hard-link creation fails if target already exists; unlike rename it
+    # cannot overwrite an existing identity. The temporary file is local.
+    tmp="$(mktemp "${target}.XXXXXXXX")"
+    trap 'rm -f -- "$tmp"' EXIT
+    wg genkey > "$tmp"
+    chmod 0600 "$tmp"
+    ln -- "$tmp" "$target"
+    rm -f -- "$tmp"
+    trap - EXIT
+    ;;
+
+  update-public-key)
+    [[ $# -eq 2 ]] || usage
+    tmp="$(mktemp "${2}.XXXXXXXX")"
+    trap 'rm -f -- "$tmp"' EXIT
+    wg pubkey < "$1" > "$tmp"
+    chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$2"
+    trap - EXIT
+    ;;
+
+  public-key-matches)
+    [[ $# -eq 2 ]] || usage
+    [[ -f "$2" ]] || exit 1
+    actual="$(wg pubkey < "$1")"
+    stored="$(cat "$2")"
+    [[ "$actual" == "$stored" ]]
+    ;;
+
+  key-matches)
+    [[ $# -eq 2 ]] || usage
+    interface="$1"
+    private_key="$2"
+    on_disk="$(wg pubkey < "$private_key")"
+    in_use="$(wg show "$interface" public-key)" || exit 1
+    [[ "$on_disk" == "$in_use" ]]
+    ;;
+
+  install-config)
+    [[ $# -eq 2 ]] || usage
+    staged="$1"
+    live="$2"
+    # Staged basename MUST be <interface>.conf for wg-quick.
+    # This validates wg-quick processing, but not the kernel's full
+    # WireGuard configuration parser.
+    wg-quick strip "$staged" >/dev/null
+    # Same-directory temporary file guarantees same-filesystem rename.
+    tmp="$(mktemp "${live}.XXXXXXXX")"
+    trap 'rm -f -- "$tmp"' EXIT
+    install -o root -g root -m 0600 -- "$staged" "$tmp"
+    mv -f -- "$tmp" "$live"
+    trap - EXIT
+    ;;
+
+  sync-config)
+    [[ $# -eq 2 ]] || usage
+    interface="$1"
+    live="$2"
+    # Do not use process substitution: if strip fails, wg might receive
+    # an empty file and inadvertently remove peers.
+    stripped="$(mktemp /etc/wireguard/.wg-sync.XXXXXXXX)"
+    trap 'rm -f -- "$stripped"' EXIT
+    wg-quick strip "$live" > "$stripped"
+    wg syncconf "$interface" "$stripped"
+    ;;
+
+  addresses-match)
+    [[ $# -ge 2 ]] || usage
+
+    interface="$1"
+    shift
+
+    # Retrieve all addresses on the interface.
+    ip_output="$(ip -o address show dev "$interface")" || exit 1
+
+    # Ignore automatically assigned IPv6 link-local addresses.
+    actual="$(
+      printf '%s\n' "$ip_output" |
+        awk '$3 == "inet" || ($3 == "inet6" && $4 !~ /^fe80:/) {print $4}' |
+        LC_ALL=C sort -u
+    )"
+
+    # Puppet-specified addresses.
+    expected="$(
+      printf '%s\n' "$@" |
+        LC_ALL=C sort -u
+    )"
+
+    [[ "$actual" == "$expected" ]]
+    ;;
+  *) usage ;;
+esac
